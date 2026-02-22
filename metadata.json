@@ -1,0 +1,5 @@
+{
+  "name": "OI Assistant MVP",
+  "description": "An AI-powered teaching assistant for competitive programming, providing Socratic guidance and code evaluation.",
+  "requestFramePermissions": []
+}

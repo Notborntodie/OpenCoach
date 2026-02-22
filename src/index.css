@@ -1,0 +1,24 @@
+@import "tailwindcss";
+
+/* Monaco Editor AI Hint Glyph */
+.ai-hint-glyph {
+  background: #3b82f6; /* blue-500 */
+  border-radius: 50%;
+  width: 10px !important;
+  height: 10px !important;
+  margin-left: 5px;
+  margin-top: 5px;
+  box-shadow: 0 0 8px #3b82f6;
+  cursor: pointer;
+}
+
+.ai-hint-glyph::after {
+  content: 'AI';
+  font-size: 6px;
+  color: white;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  font-weight: bold;
+}
