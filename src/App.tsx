@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
+import { flushSync } from 'react-dom';
 import { Play, MessageSquare, BookOpen, CheckCircle, XCircle, Send, Loader2, Lightbulb, Code2, Bug, Terminal } from 'lucide-react';
-import { GoogleGenAI } from '@google/genai';
 import Editor, { OnMount } from '@monaco-editor/react';
 
 // ==========================================
@@ -237,7 +237,7 @@ export default function App() {
   // ==========================================
   // 3. 核心：封装包含“名师经验”的 AI 请求调用
   // ==========================================
-  const callGeminiAPI = async (userMessage: string, context: { mode: string, errorLog?: string, specificContext?: string }) => {
+  const callLLMAPI = async (userMessage: string, context: { mode: string, errorLog?: string, specificContext?: string }) => {
     setIsTyping(true);
     
     const { mode, errorLog, specificContext } = context;
@@ -286,22 +286,107 @@ ${errorLog ? `评测报错日志：\n\`\`\`\n${errorLog}\n\`\`\`` : ""}
 请基于以上所有信息，回复学生的最新疑问。回复要简短有力，像一位真正的严师益友。
 `;
 
-    try {
-      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-      const response = await ai.models.generateContent({
-        model: "gemini-3-flash-preview",
-        contents: userMessage,
-        config: {
-          systemInstruction: systemInstruction,
-        }
-      });
-      
-      const aiResponse = response.text || "抱歉，助教开小差了，请稍后再试。";
-      setChatHistory(prev => [...prev, { role: 'assistant', content: aiResponse }]);
+    const apiKey = process.env.LLM_API_KEY;
+    const baseURL = process.env.LLM_BASE_URL;
+    const modelId = process.env.LLM_MODEL_ID ;
 
+    if (!apiKey || !baseURL) {
+      setIsTyping(false);
+      setChatHistory(prev => [...prev, { role: 'assistant', content: '请配置 .env 中的 LLM_API_KEY 和 LLM_BASE_URL（如阿里云 DashScope）。' }]);
+      return;
+    }
+
+    try {
+      // 开发环境走 Vite 代理，避免 CORS；生产环境直连
+      const useProxy = import.meta.env.DEV;
+      const url = useProxy ? '/api/llm/chat/completions' : `${baseURL.replace(/\/$/, '')}/chat/completions`;
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (!useProxy) headers['Authorization'] = `Bearer ${apiKey}`;
+
+      // 先追加一条空内容的 assistant 消息，用于流式更新；并关闭“打字中”避免重复提示
+      setChatHistory(prev => [...prev, { role: 'assistant', content: '' }]);
+      setIsTyping(false);
+
+      const res = await fetch(url, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          model: modelId,
+          messages: [
+            { role: 'system', content: systemInstruction },
+            { role: 'user', content: userMessage },
+          ],
+          stream: true,
+        }),
+      });
+      if (!res.ok) {
+        const errText = await res.text();
+        throw new Error(errText || `HTTP ${res.status}`);
+      }
+      const reader = res.body?.getReader();
+      const decoder = new TextDecoder();
+      if (!reader) {
+        setChatHistory(prev => {
+          const next = [...prev];
+          next[next.length - 1] = { ...next[next.length - 1], content: '抱歉，助教开小差了，请稍后再试。' };
+          return next;
+        });
+        return;
+      }
+      let buffer = '';
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() ?? '';
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              const data = line.slice(6);
+              if (data === '[DONE]') continue;
+              try {
+                const json = JSON.parse(data);
+                const chunk = json.choices?.[0]?.delta?.content;
+                if (typeof chunk === 'string') {
+                  flushSync(() => {
+                    setChatHistory(prev => {
+                      const next = [...prev];
+                      const last = next[next.length - 1];
+                      if (last.role === 'assistant') next[next.length - 1] = { ...last, content: last.content + chunk };
+                      return next;
+                    });
+                  });
+                }
+              } catch (_) {}
+            }
+          }
+        }
+        // 若流结束仍无内容，补一句兜底
+        setChatHistory(prev => {
+          const next = [...prev];
+          const last = next[next.length - 1];
+          if (last.role === 'assistant' && !last.content.trim()) next[next.length - 1] = { ...last, content: '抱歉，助教开小差了，请稍后再试。' };
+          return next;
+        });
+      } catch (streamErr) {
+        console.error("Stream Error:", streamErr);
+        setChatHistory(prev => {
+          const next = [...prev];
+          const last = next[next.length - 1];
+          if (last.role === 'assistant' && !last.content.trim()) next[next.length - 1] = { ...last, content: '网络请求失败，请检查连接。' };
+          return next;
+        });
+      }
     } catch (error) {
       console.error("AI Error:", error);
-      setChatHistory(prev => [...prev, { role: 'assistant', content: "网络请求失败，请检查连接。" }]);
+      setChatHistory(prev => {
+        const next = [...prev];
+        const last = next[next.length - 1];
+        if (last?.role === 'assistant' && last.content === '') next[next.length - 1] = { ...last, content: "网络请求失败，请检查连接。" };
+        else next.push({ role: 'assistant', content: "网络请求失败，请检查连接。" });
+        return next;
+      });
     } finally {
       setIsTyping(false);
     }
@@ -313,14 +398,14 @@ ${errorLog ? `评测报错日志：\n\`\`\`\n${errorLog}\n\`\`\`` : ""}
     const msg = inputText.trim();
     setChatHistory(prev => [...prev, { role: 'user', content: msg }]);
     setInputText("");
-    callGeminiAPI(msg, { mode: 'GENERAL' });
+    callLLMAPI(msg, { mode: 'GENERAL' });
   };
 
   // 主动请求提示
   const requestHint = () => {
     const msg = "老师，我对这道题有点没思路，你能给我一点方向性的提示吗？";
     setChatHistory(prev => [...prev, { role: 'user', content: msg }]);
-    callGeminiAPI("学生请求了一次思路提示。请根据教练经验，给出第一步的思考方向。", { mode: 'WA_ALGO', specificContext: "学生主动请求思路" });
+    callLLMAPI("学生请求了一次思路提示。请根据教练经验，给出第一步的思考方向。", { mode: 'WA_ALGO', specificContext: "学生主动请求思路" });
   };
 
   // ==========================================
@@ -342,7 +427,7 @@ ${errorLog ? `评测报错日志：\n\`\`\`\n${errorLog}\n\`\`\`` : ""}
         // 在编辑器中添加视觉引导
         addEditorHint(missingSemicolonLine + 1, "编译器在这里附近感到困惑，检查一下是否漏掉了‘句号’？");
 
-        callGeminiAPI(
+        callLLMAPI(
           `【系统内部指令】：学生提交了代码，结果为 CE。报错日志为：\`${errorLog}\`。请启动【翻译官模式】引导。`,
           { mode: 'CE', errorLog, specificContext: "学生遇到了编译错误" }
         );
@@ -362,7 +447,7 @@ ${errorLog ? `评测报错日志：\n\`\`\`\n${errorLog}\n\`\`\`` : ""}
            "status": "OUT_OF_BOUNDS"
          });
 
-         callGeminiAPI(
+         callLLMAPI(
            `【系统内部指令】：学生提交了代码，结果为 RE。报错日志为：\`${errorLog}\`。请启动【侦探模式】引导。`,
            { mode: 'RE', errorLog, specificContext: "学生遇到了运行时错误" }
          );
@@ -381,7 +466,7 @@ ${errorLog ? `评测报错日志：\n\`\`\`\n${errorLog}\n\`\`\`` : ""}
           "sum": "-1486618624 (Wrong!)"
         });
 
-        callGeminiAPI(
+        callLLMAPI(
           "学生提交了代码，结果为 WA。请启动【推演家模式】引导，针对可能的数据溢出问题进行提问。",
           { mode: 'WA_LOGIC', specificContext: "学生遇到了逻辑错误（溢出）" }
         );
